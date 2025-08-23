@@ -5,6 +5,7 @@ import torch.optim as optim
 import collections
 from .utils import _to_t
 from .networks import Representation, Actor, Critic
+import math
 
 
 class METRAAgent:
@@ -57,7 +58,7 @@ class METRAAgent:
     def update(self, replay_buffer):
         log_info = collections.defaultdict(list)
 
-        for _ in range(self.config["trans_optimization_epochs"]):
+        for _ in range(max(1, int(self.config.get("trans_optimization_epochs", 2)))):
             # Sample batch from replay buffer
             state, action, _, next_state, done, skill = replay_buffer.sample(
                 self.config["batch_size"]
@@ -76,16 +77,17 @@ class METRAAgent:
 
             # Intrinsic reward: (φ(s') - φ(s))^T z
             delta_phi = phi_sp - phi_s
-            intrinsic_reward = torch.sum(delta_phi * z, dim=1, keepdim=True)
+            intrinsic_reward = torch.sum(delta_phi * z, dim=1, keepdim=True)  # shape [B,1]
 
-            # Temporal-Lipschitz constraint
-            eps = self.dual_slack
-            lip_sq = torch.sum(delta_phi**2, dim=1)
-            c = torch.minimum(torch.full_like(lip_sq, eps), 1.0 - lip_sq)
+            # Violation-based temporal-Lipschitz constraint (closer to paper/repo style)
+            eps = float(self.config.get("dual_slack", getattr(self, "dual_slack", 1e-3)))
+            lip_sq = torch.sum(delta_phi**2, dim=1)           # ||Δφ||^2
+            violation = torch.relu(lip_sq - 1.0)              # max(0, ||Δφ||^2 - 1)
 
             if self.use_dual:
                 dual_lam = self.log_dual_lam.exp()
-                phi_obj = intrinsic_reward.squeeze(1) + dual_lam.detach() * c
+                # φ objective: maximize intrinsic and penalize violation; detach λ in φ update
+                phi_obj = intrinsic_reward.squeeze(1) - dual_lam.detach() * violation
                 phi_loss = -phi_obj.mean()
             else:
                 phi_loss = -intrinsic_reward.mean()
@@ -97,8 +99,9 @@ class METRAAgent:
             self.phi_optimizer.step()
 
             if self.use_dual:
-                # Dual variable update
-                lambda_loss = (dual_lam * c.detach()).mean()
+                # Dual update: push violation toward eps
+                # If violation > eps, λ increases; if violation < eps, λ decreases.
+                lambda_loss = (dual_lam * (violation.detach() - eps)).mean()
                 self.dual_lam_optimizer.zero_grad()
                 lambda_loss.backward()
                 nn.utils.clip_grad_norm_([self.log_dual_lam],
@@ -107,15 +110,16 @@ class METRAAgent:
 
                 # Cap λ to prevent runaway growth
                 with torch.no_grad():
-                    if self.log_dual_lam.exp().item() > self.dual_lam_max:
+                    lam_val = self.log_dual_lam.exp().item()
+                    if lam_val > self.dual_lam_max:
                         self.log_dual_lam.copy_(
                         torch.log(torch.tensor(self.dual_lam_max, device=self.device))
                         )
 
                 log_info["lambda_loss"].append(lambda_loss.item())
                 log_info["dual_lambda"].append(dual_lam.item())
-                violation = torch.relu(lip_sq - 1.0)
                 log_info["constraint_violation"].append(violation.mean().item())
+                log_info["delta_phi_norm2"].append(lip_sq.mean().item())
 
             # 2) Critic update (SAC)
             r = intrinsic_reward.detach()
@@ -169,6 +173,7 @@ class METRAAgent:
             log_info["alpha"].append(self.log_alpha.exp().item())
             log_info["intrinsic_reward"].append(intrinsic_reward.mean().item())
             log_info["q_value"].append(q1.mean().item())
+            log_info["phi_obj"].append(phi_obj.mean().item() if self.use_dual else intrinsic_reward.mean().item())
 
         # Average logs over all optimization epochs
         final_logs = {k: float(np.mean(v)) for k, v in log_info.items()}
@@ -225,3 +230,7 @@ class METRAAgent:
         if ckpt.get("log_dual_lam") is not None:
             self.log_dual_lam = ckpt["log_dual_lam"].to(self.device).requires_grad_()
             self.use_dual = True
+        # Safety: ensure learned λ respects cap after load
+        if self.use_dual and self.log_dual_lam.exp().item() > self.dual_lam_max:
+            with torch.no_grad():
+                self.log_dual_lam.copy_(torch.log(torch.tensor(self.dual_lam_max, device=self.device)))
